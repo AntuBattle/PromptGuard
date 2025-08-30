@@ -1,11 +1,11 @@
 # PromptGuard
 
-[![MIT license](https://img.shields.io/badge/license-MIT-brightgreen.svg)](http://opensource.org/licenses/MIT)
-
 Welcome to PromptGuard.
 A free, open-source prompt hardening and injection detection library.
 
-It is currently a work in progress, but the goal is to deliver the most complete open source solution to harden GenAI applications in this AI era.
+[![MIT license](https://img.shields.io/badge/license-MIT-brightgreen.svg)](http://opensource.org/licenses/MIT)
+
+This library is currently a work in progress, but the goal is to deliver the most complete open source solution to harden GenAI applications in this AI era.
 
 ## Isn't there plenty of tools out there?
 
