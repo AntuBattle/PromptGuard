@@ -42,16 +42,28 @@ class NLPFilter:
 
     def safe_eval(self, prompt: str, threshold: float = 0.95) -> FilteredOutput:
         doc = self.nlp(prompt)
+        similarity = 0.0
+        most_similar_text = None
         for record in self.dataset:
             text = record["text"] if "text" in record.keys() else record[0]
             dataset_doc = self.nlp(text)
-            similarity = doc.similarity(dataset_doc)
+            doc_similarity = doc.similarity(dataset_doc)
+            if doc_similarity > similarity:
+                similarity = doc_similarity
+                most_similar_text = text
+
             if similarity >= threshold:
                 LOGGER.info(
                     f"Prompt blocked due to similarity score of {similarity} with dataset entry: {text}"
                 )
-                return FilteredOutput(output=prompt, score="BLOCKED")
-        return FilteredOutput(output=prompt, score="SAFE")
+                return FilteredOutput(
+                    output=prompt,
+                    score={"label": 1, "similarity": similarity, "matched_text": text},
+                )
+        return FilteredOutput(
+            output=prompt,
+            score={"label": 0, "similarity": similarity, "matched_text": most_similar_text},
+        )
 
 
 if __name__ == "__main__":

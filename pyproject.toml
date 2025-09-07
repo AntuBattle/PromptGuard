@@ -18,6 +18,9 @@ dev = [
     "pytest>=8.4.1",
     "ruff>=0.12.10",
 ]
-spacy = [
+ml = [
+    "sentence-transformers>=5.1.0",
+]
+nlp = [
     "spacy>=3.8.7",
 ]
