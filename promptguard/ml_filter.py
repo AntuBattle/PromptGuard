@@ -259,7 +259,7 @@ class MLFilter:
         Evaluate `prompt` against the malicious entries from the dataset.
         Returns a FilteredOutput object. The `score` field contains a dict with:
             {
-                "label": "BLOCKED" | "SAFE",
+                "label": 1 (BLOCKED) | 0 (SAFE),
                 "similarity": float (max similarity found),
                 "matched_text": str | None
             }

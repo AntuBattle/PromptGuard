@@ -18,6 +18,9 @@ dev = [
     "pytest>=8.4.1",
     "ruff>=0.12.10",
 ]
+llm = [
+    "openai>=1.109.1",
+]
 ml = [
     "sentence-transformers>=5.1.0",
 ]
