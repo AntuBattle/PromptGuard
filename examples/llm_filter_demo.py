@@ -43,41 +43,23 @@ class MockHeuristicClient:
     ) -> Dict[str, Any]:
         text = prompt.lower()
         reasons: List[str] = []
-        matched_spans: List[Dict[str, Any]] = []
-        violations: List[str] = []
-
-        def add_span(sub: str, vtype: str):
-            s = text.find(sub.lower())
-            if s >= 0:
-                e = s + len(sub)
-                matched_spans.append(
-                    {"text": prompt[s:e], "start": s, "end": e, "violation_type": vtype}
-                )
 
         if "ignore all previous instructions" in text or "forget previous instructions" in text:
             reasons.append("instruction_override")
-            violations.append("system_override")
-            add_span("ignore all previous instructions", "system_override")
 
         if "reveal the system prompt" in text or "print the system prompt" in text:
             reasons.append("prompt_exfiltration")
-            violations.append("data_exfiltration")
-            add_span("system prompt", "data_exfiltration")
 
         if "jailbreak" in text or "dan" in text:
             reasons.append("jailbreak_marker")
-            violations.append("jailbreak")
-            add_span("jailbreak", "jailbreak")
 
-        label = 1 if (reasons or matched_spans) else 0
+        label = 1 if reasons else 0
         confidence = 0.9 if label == 1 else 0.7
 
         return {
             "label": label,
             "confidence": confidence,
-            "reasons": reasons if reasons else ["benign_request"],
-            "matched_spans": matched_spans,
-            "policy_violations": violations,
+            "reason": ", ".join(reasons) if reasons else "benign_request",
         }
 
 

@@ -2,7 +2,6 @@
 This module allows to check an input or output prompt against a dataset (default deepset/prompt-injections), returning the similarity score.
 
 Author: Antonio Battaglia
-28th August 2025
 """
 
 from typing import Any
@@ -40,7 +39,7 @@ class NLPFilter:
                 lambda x: x["label"] == 1
             )  # Keep only malicious prompts
 
-    def safe_eval(self, prompt: str, threshold: float = 0.95) -> FilteredOutput:
+    def safe_eval(self, prompt: str, threshold: float = 0.90) -> FilteredOutput:
         doc = self.nlp(prompt)
         similarity = 0.0
         most_similar_text = None
@@ -64,13 +63,3 @@ class NLPFilter:
             output=prompt,
             score={"label": 0, "similarity": similarity, "matched_text": most_similar_text},
         )
-
-
-if __name__ == "__main__":
-    from datasets import load_dataset
-
-    prompt: str = load_dataset("deepset/prompt-injections")["test"][1]["text"]
-    nlpfilter = NLPFilter("en")
-    out = nlpfilter.safe_eval(prompt)
-    print(out.score)
-    print(out.output)

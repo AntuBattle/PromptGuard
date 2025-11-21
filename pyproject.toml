@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "datasets>=4.0.0",
+    "ollama>=0.6.1",
     "structlog>=25.4.0",
 ]
 

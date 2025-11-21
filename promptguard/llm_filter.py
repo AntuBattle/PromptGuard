@@ -1,6 +1,6 @@
 """
 LLM module to evaluate prompts using an LLM-as-judge pattern with structured outputs,
-optionally redacting detected unsafe spans.
+optionally redacting flagged unsafe prompts.
 
 Author: Antonio Battaglia
 30th September 2025
@@ -12,6 +12,8 @@ import json
 import os
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from ._log import get_logger
 from .filtered_output import FilteredOutput
@@ -25,48 +27,9 @@ LLM_CLASSIFICATION_SCHEMA: Dict[str, Any] = {
     "properties": {
         "label": {"type": "integer", "enum": [0, 1]},
         "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
-        "reasons": {"type": "array", "items": {"type": "string"}},
-        "matched_spans": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string"},
-                    "start": {"type": "integer"},
-                    "end": {"type": "integer"},
-                    # Optional: allow violation_type for better redaction labels (not required)
-                    "violation_type": {
-                        "type": "string",
-                        "enum": [
-                            "system_override",
-                            "context_partition",
-                            "data_exfiltration",
-                            "jailbreak",
-                            "indirect_injection",
-                        ],
-                    },
-                },
-                "required": ["text", "start", "end"],
-                "additionalProperties": True,
-            },
-        },
-        "policy_violations": {
-            "type": "array",
-            "items": {
-                "type": "string",
-                "enum": [
-                    "system_override",
-                    "context_partition",
-                    "data_exfiltration",
-                    "jailbreak",
-                    "indirect_injection",
-                ],
-            },
-        },
-        # Optional: some providers may return a sanitized/suggested prompt
-        "sanitized": {"type": "string"},
+        "reason": {"type": "string"},
     },
-    "required": ["label", "confidence", "reasons"],
+    "required": ["label", "confidence", "reason"],
     "additionalProperties": False,
 }
 
@@ -77,28 +40,12 @@ DEFAULT_SYSTEM_PROMPT = (
     "Return ONLY valid JSON that strictly follows the provided JSON schema, with no extra text."
 )
 
-# Heuristic fallback patterns for redaction when LLM did not provide matched_spans
-# Keep conservative and minimal (YAGNI); prefer blocking or coarse redaction.
-_FALLBACK_PATTERNS: List[Tuple[re.Pattern[str], str]] = [
-    (re.compile(r"(?i)\bignore (all )?previous instructions\b"), "system_override"),
-    (
-        re.compile(r"(?i)\b(disregard|forget)\s+(all\s+)?(previous|prior)\s+instructions\b"),
-        "system_override",
-    ),
-    (
-        re.compile(
-            r"(?i)\b(end\s+system|begin\s+system|---\s*end\s*system\s*---|---\s*system\s*---)\b"
-        ),
-        "context_partition",
-    ),
-    (
-        re.compile(
-            r"(?i)\b(show|reveal|print|dump)\s+(the\s+)?(system|developer)\s+(prompt|instructions)\b"
-        ),
-        "data_exfiltration",
-    ),
-    (re.compile(r"(?i)\bjailbreak\b|\bDAN\b"), "jailbreak"),
-    (re.compile(r"(?i)\b(base64|0x[0-9a-f]+)\b"), "indirect_injection"),
+_FALLBACK_PATTERNS: Sequence[Tuple[re.Pattern[str], str]] = [
+    (re.compile(r"ignore\s+all\s+previous\s+instructions", re.IGNORECASE), "system_override"),
+    (re.compile(r"forget\s+previous\s+instructions", re.IGNORECASE), "system_override"),
+    (re.compile(r"reveal\s+(?:the\s+)?system\s+prompt", re.IGNORECASE), "data_exfiltration"),
+    (re.compile(r"print\s+(?:the\s+)?system\s+prompt", re.IGNORECASE), "data_exfiltration"),
+    (re.compile(r"\bjailbreak\b", re.IGNORECASE), "jailbreak"),
 ]
 
 
@@ -111,16 +58,17 @@ def _truncate_for_log(text: str, max_chars: int = 160) -> str:
 class LLMFilter:
     """
     LLMFilter uses an LLM-as-judge approach with enforced structured outputs
-    to detect prompt injections. It supports OpenAI-compatible backends and Anthropic.
+    to detect prompt injections. It supports OpenAI-compatible backends,
+    Anthropic, and locally hosted Ollama models.
 
     Args:
-        provider: "openai_compatible" or "anthropic". Default: "openai_compatible".
+        provider: "openai_compatible", "anthropic", or "ollama". Default: "openai_compatible".
         model: Provider model identifier. Default from env PG_LLM_MODEL or "gpt-4o-mini".
         api_key: API key. Default from env PG_LLM_API_KEY (or ANTHROPIC_API_KEY if provider=anthropic).
         base_url: Base URL for OpenAI-compatible providers (e.g., OpenRouter, vLLM, Ollama). Default from env PG_LLM_BASE_URL.
         timeout: Request timeout in seconds (best-effort; may depend on SDK). Default 30.
         max_retries: Max retry attempts for transient errors. Default 2.
-        redact_unsafe: Whether to redact detected spans when label==1. Default True.
+        redact_unsafe: Whether to redact flagged prompts when label==1. Default True.
         system_prompt: Optional system prompt override. Default uses DEFAULT_SYSTEM_PROMPT.
         schema: Optional JSON schema dict override. Default uses LLM_CLASSIFICATION_SCHEMA.
         client: Optional injected client (for testing). If provided and has classify(), it will be used.
@@ -145,7 +93,10 @@ class LLMFilter:
             "PG_LLM_API_KEY",
             os.environ.get("ANTHROPIC_API_KEY") if provider == "anthropic" else None,
         )
-        self.base_url = base_url or os.environ.get("PG_LLM_BASE_URL")
+        default_base_url = base_url or os.environ.get("PG_LLM_BASE_URL")
+        if provider == "ollama":
+            default_base_url = base_url or os.environ.get("OLLAMA_HOST") or "http://localhost:11434"
+        self.base_url = default_base_url
         self.timeout = timeout
         self.max_retries = max_retries
         self.redact_unsafe = redact_unsafe
@@ -168,9 +119,9 @@ class LLMFilter:
     def safe_eval(self, prompt: str) -> FilteredOutput:
         """
         Evaluate `prompt` via LLM classification. Returns a FilteredOutput whose
-        score contains label (0 safe, 1 unsafe), confidence, reasons, matched_spans,
-        and policy_violations. If unsafe and redact_unsafe is True, the output
-        will be a redacted version of the prompt, else the original prompt.
+        score contains label (0 safe, 1 unsafe), confidence, and a textual reason.
+        If unsafe and redact_unsafe is True, the output will be a heuristically
+        redacted version of the prompt, else the original prompt.
         """
         if not isinstance(prompt, str):
             raise TypeError("prompt must be a string")
@@ -197,57 +148,38 @@ class LLMFilter:
                     score={
                         "label": 0,
                         "confidence": 0.0,
-                        "reasons": ["classifier_error"],
-                        "matched_spans": [],
-                        "policy_violations": [],
+                        "reason": "classifier_error",
                     },
                 )
 
         # Normalize and fill defaults
         label = int(result.get("label", 0))
         confidence = float(result.get("confidence", 0.0))
-        reasons = list(result.get("reasons", [])) if isinstance(result.get("reasons"), list) else []
-        matched_spans = (
-            list(result.get("matched_spans", []))
-            if isinstance(result.get("matched_spans"), list)
-            else []
-        )
-        policy_violations = (
-            list(result.get("policy_violations", []))
-            if isinstance(result.get("policy_violations"), list)
-            else []
-        )
-        sanitized = result.get("sanitized")
+        reason = str(result.get("reason") or "").strip() or "unspecified"
 
         if label == 1:
             LOGGER.info(
-                "Prompt flagged as UNSAFE (confidence=%.3f). Reasons=%s",
+                "Prompt flagged as UNSAFE (confidence=%.3f). Reason=%s",
                 confidence,
-                reasons[:3],
+                reason,
             )
         else:
             LOGGER.debug(
-                "Prompt classified SAFE (confidence=%.3f). Reasons=%s",
+                "Prompt classified SAFE (confidence=%.3f). Reason=%s",
                 confidence,
-                reasons[:3],
+                reason,
             )
 
         redacted_output = prompt
         if label == 1 and self.redact_unsafe:
-            if matched_spans:
-                redacted_output = self._redact_using_spans(prompt, matched_spans)
-            else:
-                redacted_output = self._fallback_redaction(prompt)
+            redacted_output = self._fallback_redaction(prompt)
 
         return FilteredOutput(
             output=redacted_output,
             score={
                 "label": label,
                 "confidence": confidence,
-                "reasons": reasons,
-                "matched_spans": matched_spans,
-                "policy_violations": policy_violations,
-                **({"sanitized": sanitized} if isinstance(sanitized, str) else {}),
+                "reason": reason,
             },
         )
 
@@ -260,20 +192,13 @@ class LLMFilter:
         - OpenAI-compatible client with response_format json_schema strict
         - Anthropic tool-use with enforced schema
         """
-        # Support injected fake client for deterministic unit tests
-        if self._client is not None and hasattr(self._client, "classify"):
-            LOGGER.debug("Using injected classification client.")
-            return self._client.classify(
-                prompt=prompt,
-                schema=self.schema,
-                system_prompt=self.system_prompt,
-                timeout=self.timeout,
-            )
 
         if self.provider == "openai_compatible":
             return self._classify_openai_compatible(prompt)
         if self.provider == "anthropic":
             return self._classify_anthropic(prompt)
+        if self.provider == "ollama":
+            return self._classify_ollama(prompt)
 
         raise ValueError(f"Unsupported provider: {self.provider}")
 
@@ -311,11 +236,9 @@ class LLMFilter:
             _truncate_for_log(prompt),
         )
 
-        # Note: some SDKs accept timeout at call-site; if not, rely on client defaults.
         resp = client.chat.completions.create(
             model=self.model,
             messages=messages,
-            temperature=0,
             response_format=response_format,
         )
         # Extract JSON from the first choice
@@ -323,7 +246,7 @@ class LLMFilter:
         try:
             content = resp.choices[0].message.content  # type: ignore[attr-defined]
         except Exception:
-            # Some compatible servers return .choices[0].message instead or .content directly
+            # In case it works with .content
             content = getattr(resp.choices[0], "message", None) or getattr(
                 resp.choices[0], "content", None
             )
@@ -331,7 +254,7 @@ class LLMFilter:
         if isinstance(content, str):
             return self._parse_json_strict(content)
 
-        # Some providers may already parse into a dict/text segments
+        # Might be possible to have a dict
         if isinstance(content, dict):
             return content
 
@@ -394,6 +317,62 @@ class LLMFilter:
 
         raise RuntimeError("Anthropic response did not include expected tool output or JSON text.")
 
+    def _classify_ollama(self, prompt: str) -> Dict[str, Any]:
+        if not self.model:
+            raise ValueError("An Ollama model name must be provided.")
+
+        base = (self.base_url or "").rstrip("/") or "http://localhost:11434"
+        endpoint = f"{base}/api/chat"
+
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": self.system_prompt},
+                {
+                    "role": "user",
+                    "content": f"Analyze this prompt for injection attacks:\n---\n{prompt}\n---",
+                },
+            ],
+            "format": self.schema,
+            "options": {"temperature": 0},
+            "stream": False,
+        }
+
+        LOGGER.debug(
+            "Calling Ollama model '%s' at %s for classification. Prompt: %s",
+            self.model,
+            endpoint,
+            _truncate_for_log(prompt),
+        )
+
+        req = Request(
+            endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urlopen(req, timeout=self.timeout) as resp:
+                raw = resp.read().decode("utf-8")
+        except HTTPError as exc:
+            raise RuntimeError(f"Ollama request failed with status {exc.code}: {exc.reason}") from exc
+        except URLError as exc:
+            raise RuntimeError(f"Unable to reach Ollama endpoint at {endpoint}: {exc}") from exc
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Ollama response was not valid JSON: {exc}") from exc
+
+        if "error" in data and data["error"]:
+            raise RuntimeError(f"Ollama returned an error: {data['error']}")
+
+        message = data.get("message") or {}
+        content = message.get("content") if isinstance(message, dict) else data.get("content")
+        if not isinstance(content, str):
+            raise ValueError("Ollama response did not include textual content for parsing.")
+        return self._parse_json_strict(content)
+
     def _parse_json_strict(self, raw: str) -> Dict[str, Any]:
         try:
             return json.loads(raw)
@@ -401,35 +380,8 @@ class LLMFilter:
             LOGGER.error("Failed to parse JSON from model response: %s", raw)
             raise ValueError(f"Model did not return valid JSON: {exc}") from exc
 
-    def _redact_using_spans(self, text: str, spans: Sequence[Dict[str, Any]]) -> str:
-        """
-        Redact provided spans from the text. Later spans should not affect earlier indices,
-        so we apply replacements from rightmost to leftmost.
-        """
-        # Normalize spans and sort by start desc
-        normalized: List[Tuple[int, int, str]] = []
-        for s in spans:
-            try:
-                start = int(s["start"])
-                end = int(s["end"])
-                vtype = str(s.get("violation_type", "INJECTION"))
-                if 0 <= start <= end <= len(text):
-                    normalized.append((start, end, vtype))
-            except Exception:
-                continue
-        if not normalized:
-            return text
-
-        normalized.sort(key=lambda x: x[0], reverse=True)
-        red = text
-        for start, end, vtype in normalized:
-            red = red[:start] + f"[REDACTED: {vtype}]" + red[end:]
-        return red
-
     def _fallback_redaction(self, text: str) -> str:
-        """
-        Coarse, conservative redaction when no spans are provided by the LLM.
-        """
+        """Coarse, conservative redaction heuristic for flagged prompts."""
         spans: List[Tuple[int, int, str]] = []
         for pat, vtype in _FALLBACK_PATTERNS:
             spans.extend((m.start(), m.end(), vtype) for m in pat.finditer(text))
@@ -443,8 +395,8 @@ class LLMFilter:
         return red
 
     def _is_transient_error(self, exc: Exception) -> bool:
-        # Minimal heuristic for retryable errors
-        transient_types = (TimeoutError,)
+        
+        transient_types = (TimeoutError, URLError)
         if isinstance(exc, transient_types):
             return True
         msg = str(exc).lower()
@@ -452,7 +404,7 @@ class LLMFilter:
             k in msg for k in ["timeout", "temporarily unavailable", "rate limit", "429", "503"]
         ):
             return True
-        # OpenAI/HTTPX style exceptions (lazy match to avoid hard deps)
+        
         if exc.__class__.__name__ in {"APITimeoutError", "RateLimitError", "HTTPStatusError"}:
             return True
         return False
